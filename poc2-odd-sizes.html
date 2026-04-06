@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html>
+<head><title>WebNN pool2d ceil rounding - Odd Sizes</title></head>
+<body>
+<h2>WebNN pool2d ceil rounding - Odd Input Sizes</h2>
+<pre id="output"></pre>
+<script>
+const log = (msg) => {
+  console.log(msg);
+  document.getElementById('output').textContent += msg + '\n';
+};
+
+async function testOddSizes() {
+  log('=== PoC 2: Odd input sizes with ceil rounding ===');
+  log('Testing sizes 5, 7, 9, 11, 13 with stride 2, window 2');
+  log('');
+
+  if (!navigator.ml) {
+    log('ERROR: WebNN API not available');
+    return;
+  }
+
+  let context;
+  try {
+    context = await navigator.ml.createContext({ deviceType: 'gpu' });
+    log('Using GPU/CoreML backend');
+  } catch(e) {
+    try {
+      context = await navigator.ml.createContext({ deviceType: 'cpu' });
+      log('Using CPU backend');
+    } catch(e2) {
+      log('No ML context available: ' + e2.message);
+      return;
+    }
+  }
+
+  const sizes = [5, 7, 9, 11, 13];
+  const stride = 2;
+  const window = 2;
+
+  for (const size of sizes) {
+    const floorOut = Math.floor((size - window) / stride) + 1;
+    const ceilOut = Math.ceil((size - window) / stride) + 1;
+    const mismatch = ceilOut !== floorOut;
+
+    log(`--- Input size: ${size}x${size} ---`);
+    log(`  Floor output: ${floorOut}x${floorOut} (${floorOut * floorOut} elements)`);
+    log(`  Ceil output:  ${ceilOut}x${ceilOut} (${ceilOut * ceilOut} elements)`);
+    log(`  Mismatch: ${mismatch ? 'YES - potential overflow' : 'NO'}`);
+
+    if (!mismatch) {
+      log(`  Skipping (no floor/ceil difference)`);
+      log('');
+      continue;
+    }
+
+    const inputShape = [1, 1, size, size];
+    const inputSize = size * size;
+    const inputData = new Float32Array(inputSize);
+    for (let i = 0; i < inputSize; i++) inputData[i] = (i + 1) * 0.1;
+
+    try {
+      const builder = new MLGraphBuilder(context);
+      const input = builder.input('input', { dataType: 'float32', shape: inputShape });
+
+      // averagePool2d
+      const avgPool = builder.averagePool2d(input, {
+        windowDimensions: [window, window],
+        strides: [stride, stride],
+        padding: [0, 0, 0, 0],
+        roundingType: 'ceil',
+        layout: 'nchw'
+      });
+
+      const graph = await builder.build({ 'out': avgPool });
+
+      const ceilElements = ceilOut * ceilOut;
+      const outputBuffer = new Float32Array(ceilElements);
+
+      const results = await context.compute(graph, { 'input': new Float32Array(inputData) }, { 'out': outputBuffer });
+
+      const output = results.outputs.out || outputBuffer;
+      const vals = Array.from(output);
+      const nonZero = vals.filter(v => v !== 0).length;
+      const hasNaN = vals.some(v => isNaN(v));
+      const hasInf = vals.some(v => !isFinite(v));
+
+      log(`  avgPool2d output length: ${output.length}`);
+      log(`  Non-zero values: ${nonZero}/${ceilElements}`);
+      log(`  Has NaN: ${hasNaN}, Has Inf: ${hasInf}`);
+      log(`  Values: ${vals.map(v => v.toFixed(4)).join(', ')}`);
+
+      if (nonZero < ceilElements) {
+        log(`  *** MISMATCH CONFIRMED: Only ${nonZero} values populated out of ${ceilElements} ***`);
+        log(`  *** Buffer overflow potential: ${(ceilElements - floorOut * floorOut) * 4} bytes ***`);
+      }
+      if (hasNaN || hasInf) {
+        log(`  *** ANOMALY: NaN/Inf in output suggests memory corruption ***`);
+      }
+
+    } catch(e) {
+      log(`  ERROR: ${e.message}`);
+    }
+
+    // maxPool2d
+    try {
+      const builder2 = new MLGraphBuilder(context);
+      const input2 = builder2.input('input', { dataType: 'float32', shape: inputShape });
+
+      const maxPool = builder2.maxPool2d(input2, {
+        windowDimensions: [window, window],
+        strides: [stride, stride],
+        padding: [0, 0, 0, 0],
+        roundingType: 'ceil',
+        layout: 'nchw'
+      });
+
+      const graph2 = await builder2.build({ 'out': maxPool });
+      const ceilElements = ceilOut * ceilOut;
+      const outputBuffer2 = new Float32Array(ceilElements);
+
+      const results2 = await context.compute(graph2, { 'input': new Float32Array(inputData) }, { 'out': outputBuffer2 });
+      const output2 = results2.outputs.out || outputBuffer2;
+      const vals2 = Array.from(output2);
+      const nonZero2 = vals2.filter(v => v !== 0).length;
+
+      log(`  maxPool2d output length: ${output2.length}`);
+      log(`  Non-zero values: ${nonZero2}/${ceilElements}`);
+      log(`  Values: ${vals2.map(v => v.toFixed(4)).join(', ')}`);
+
+      if (nonZero2 < ceilElements) {
+        log(`  *** maxPool2d MISMATCH too ***`);
+      }
+
+    } catch(e) {
+      log(`  maxPool2d ERROR: ${e.message}`);
+    }
+
+    log('');
+  }
+
+  log('=== PoC 2 Complete ===');
+}
+
+testOddSizes();
+</script>
+</body>
+</html>

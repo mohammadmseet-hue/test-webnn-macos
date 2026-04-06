@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html>
+<head><title>WebNN pool2d - CPU Backend Test</title></head>
+<body>
+<pre id="output"></pre>
+<script>
+const log = (msg) => {
+  console.log(msg);
+  document.getElementById('output').textContent += msg + '\n';
+};
+
+async function test() {
+  log('STEP 1: Start - CPU backend test');
+
+  if (!navigator.ml) {
+    log('FAIL: No WebNN');
+    return;
+  }
+  log('STEP 2: navigator.ml exists');
+
+  let context;
+  try {
+    context = await navigator.ml.createContext({ deviceType: 'cpu' });
+    log('STEP 3: CPU context created');
+  } catch(e) {
+    log('STEP 3-FAIL: CPU context error: ' + e.message);
+    // Try default
+    try {
+      context = await navigator.ml.createContext();
+      log('STEP 3b: Default context created');
+    } catch(e2) {
+      log('STEP 3b-FAIL: ' + e2.message);
+      return;
+    }
+  }
+
+  let builder = new MLGraphBuilder(context);
+  log('STEP 4: Builder created');
+
+  // Test 1: Simple add (baseline)
+  try {
+    const a = builder.input('a', { dataType: 'float32', shape: [4] });
+    const b = builder.input('b', { dataType: 'float32', shape: [4] });
+    const c = builder.add(a, b);
+    const g = await builder.build({ 'c': c });
+    log('STEP 5: Add graph built');
+    const r = await context.compute(g, {
+      'a': new Float32Array([1,2,3,4]),
+      'b': new Float32Array([5,6,7,8])
+    }, { 'c': new Float32Array(4) });
+    const out = r.outputs.c;
+    log('STEP 6: Add result: ' + Array.from(out).join(','));
+  } catch(e) {
+    log('STEP 5-6 FAIL: ' + e.message);
+  }
+
+  // Test 2: pool2d with even input + ceil (no discrepancy)
+  try {
+    const b2 = new MLGraphBuilder(context);
+    const inp = b2.input('inp', { dataType: 'float32', shape: [1, 1, 4, 4] });
+    const pool = b2.averagePool2d(inp, {
+      windowDimensions: [2, 2],
+      strides: [2, 2],
+      padding: [0, 0, 0, 0],
+      roundingType: 'ceil',
+      layout: 'nchw'
+    });
+    const g = await b2.build({ 'out': pool });
+    log('STEP 7: Even pool2d graph built');
+    const r = await context.compute(g, {
+      'inp': new Float32Array([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16])
+    }, { 'out': new Float32Array(4) });
+    log('STEP 8: Even pool2d result: ' + Array.from(r.outputs.out).join(','));
+  } catch(e) {
+    log('STEP 7-8 FAIL: ' + e.message);
+  }
+
+  // Test 3: THE BUG - pool2d with ODD input + ceil (floor/ceil mismatch)
+  try {
+    const b3 = new MLGraphBuilder(context);
+    const inp2 = b3.input('inp2', { dataType: 'float32', shape: [1, 1, 5, 5] });
+    const pool2 = b3.averagePool2d(inp2, {
+      windowDimensions: [2, 2],
+      strides: [2, 2],
+      padding: [0, 0, 0, 0],
+      roundingType: 'ceil',
+      layout: 'nchw'
+    });
+    log('STEP 9: Odd avgPool2d op created');
+    const g2 = await b3.build({ 'out2': pool2 });
+    log('STEP 10: Odd avgPool2d graph built');
+
+    const inData = new Float32Array(25);
+    for (let i = 0; i < 25; i++) inData[i] = i + 1;
+    const outBuf = new Float32Array(9);
+    outBuf.fill(-999);
+
+    log('STEP 11: Computing odd avgPool2d...');
+    const r2 = await context.compute(g2, { 'inp2': inData }, { 'out2': outBuf });
+    const out2 = r2.outputs.out2;
+    log('STEP 12: Odd avgPool2d result: ' + Array.from(out2).join(','));
+    const sentinels = Array.from(out2).filter(v => v === -999).length;
+    const nans = Array.from(out2).filter(v => isNaN(v)).length;
+    log('STEP 13: Sentinels: ' + sentinels + ', NaNs: ' + nans);
+    if (sentinels > 0) log('*** MISMATCH: ' + sentinels + ' values not written (floor vs ceil) ***');
+    if (nans > 0) log('*** MEMORY CORRUPTION: NaN values ***');
+  } catch(e) {
+    log('STEP 9-13 FAIL: ' + e.message);
+  }
+
+  // Test 4: maxPool2d with the same mismatch params
+  try {
+    const b4 = new MLGraphBuilder(context);
+    const inp3 = b4.input('inp3', { dataType: 'float32', shape: [1, 1, 5, 5] });
+    const pool3 = b4.maxPool2d(inp3, {
+      windowDimensions: [2, 2],
+      strides: [2, 2],
+      padding: [0, 0, 0, 0],
+      roundingType: 'ceil',
+      layout: 'nchw'
+    });
+    log('STEP 14: Odd maxPool2d op created');
+    const g3 = await b4.build({ 'out3': pool3 });
+    log('STEP 15: Odd maxPool2d graph built');
+
+    const inData = new Float32Array(25);
+    for (let i = 0; i < 25; i++) inData[i] = i + 1;
+    const outBuf = new Float32Array(9);
+    outBuf.fill(-999);
+
+    const r3 = await context.compute(g3, { 'inp3': inData }, { 'out3': outBuf });
+    const out3 = r3.outputs.out3;
+    log('STEP 16: Odd maxPool2d result: ' + Array.from(out3).join(','));
+    const sentinels = Array.from(out3).filter(v => v === -999).length;
+    log('STEP 17: Sentinels: ' + sentinels);
+    if (sentinels > 0) log('*** maxPool2d MISMATCH too ***');
+  } catch(e) {
+    log('STEP 14-17 FAIL: ' + e.message);
+  }
+
+  // Test 5: Larger mismatch - 7x7
+  try {
+    const b5 = new MLGraphBuilder(context);
+    const inp4 = b5.input('inp4', { dataType: 'float32', shape: [1, 1, 7, 7] });
+    const pool4 = b5.averagePool2d(inp4, {
+      windowDimensions: [2, 2],
+      strides: [2, 2],
+      padding: [0, 0, 0, 0],
+      roundingType: 'ceil',
+      layout: 'nchw'
+    });
+    // floor: (7-2)/2 + 1 = 3, ceil: ceil(5/2)+1 = 4 → 9 vs 16
+    const g4 = await b5.build({ 'out4': pool4 });
+    log('STEP 18: 7x7 pool2d graph built');
+    const inData = new Float32Array(49);
+    for (let i = 0; i < 49; i++) inData[i] = (i+1) * 0.1;
+    const outBuf = new Float32Array(16);
+    outBuf.fill(-999);
+    const r4 = await context.compute(g4, { 'inp4': inData }, { 'out4': outBuf });
+    log('STEP 19: 7x7 result: ' + Array.from(r4.outputs.out4).join(','));
+    const sentinels = Array.from(r4.outputs.out4).filter(v => v === -999).length;
+    log('STEP 20: 7x7 Sentinels: ' + sentinels + '/16');
+  } catch(e) {
+    log('STEP 18-20 FAIL: ' + e.message);
+  }
+
+  log('STEP 99: ALL TESTS COMPLETE');
+}
+
+test();
+</script>
+</body>
+</html>

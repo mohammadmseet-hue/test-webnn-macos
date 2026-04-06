@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html>
+<head><title>WebNN pool2d - Pinpoint Crash Location</title></head>
+<body>
+<pre id="output"></pre>
+<script>
+const log = (msg) => {
+  console.log(msg);
+};
+
+async function pinpoint() {
+  log('STEP 1: Start');
+
+  if (!navigator.ml) {
+    log('STEP FAIL: No WebNN');
+    return;
+  }
+  log('STEP 2: navigator.ml exists');
+
+  let context;
+  try {
+    context = await navigator.ml.createContext({ deviceType: 'gpu' });
+    log('STEP 3: GPU context created');
+  } catch(e) {
+    log('STEP 3-FAIL: GPU context failed: ' + e.message);
+    try {
+      context = await navigator.ml.createContext({ deviceType: 'cpu' });
+      log('STEP 3b: CPU context created');
+    } catch(e2) {
+      log('STEP 3b-FAIL: ' + e2.message);
+      return;
+    }
+  }
+
+  let builder;
+  try {
+    builder = new MLGraphBuilder(context);
+    log('STEP 4: Builder created');
+  } catch(e) {
+    log('STEP 4-FAIL: ' + e.message);
+    return;
+  }
+
+  // First test: pool2d with EVEN input (no floor/ceil discrepancy)
+  try {
+    const input_even = builder.input('even', { dataType: 'float32', shape: [1, 1, 4, 4] });
+    log('STEP 5: Even input created [1,1,4,4]');
+
+    const pool_even = builder.averagePool2d(input_even, {
+      windowDimensions: [2, 2],
+      strides: [2, 2],
+      padding: [0, 0, 0, 0],
+      roundingType: 'ceil',
+      layout: 'nchw'
+    });
+    log('STEP 6: Even pool2d op created (ceil, but no discrepancy for 4x4)');
+
+    const graph_even = await builder.build({ 'out_even': pool_even });
+    log('STEP 7: Even graph built');
+
+    const inputData = new Float32Array([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]);
+    const outputBuffer = new Float32Array(4);
+    const results = await context.compute(graph_even, { 'even': inputData }, { 'out_even': outputBuffer });
+    const output = results.outputs.out_even || outputBuffer;
+    log('STEP 8: Even compute done: ' + Array.from(output).join(', '));
+  } catch(e) {
+    log('STEP 5-8 FAIL: ' + e.message);
+  }
+
+  // Now the dangerous test: ODD input with ceil rounding
+  try {
+    const builder2 = new MLGraphBuilder(context);
+    const input_odd = builder2.input('odd', { dataType: 'float32', shape: [1, 1, 5, 5] });
+    log('STEP 9: Odd input created [1,1,5,5]');
+
+    const pool_odd = builder2.averagePool2d(input_odd, {
+      windowDimensions: [2, 2],
+      strides: [2, 2],
+      padding: [0, 0, 0, 0],
+      roundingType: 'ceil',
+      layout: 'nchw'
+    });
+    log('STEP 10: Odd pool2d op created (ceil, MISMATCH: floor=2x2 vs ceil=3x3)');
+
+    const graph_odd = await builder2.build({ 'out_odd': pool_odd });
+    log('STEP 11: Odd graph built');
+
+    const inputData2 = new Float32Array(25);
+    for (let i = 0; i < 25; i++) inputData2[i] = i + 1;
+    const outputBuffer2 = new Float32Array(9); // ceil size
+    outputBuffer2.fill(-999);
+
+    log('STEP 12: About to compute odd pool2d...');
+    const results2 = await context.compute(graph_odd, { 'odd': inputData2 }, { 'out_odd': outputBuffer2 });
+    const output2 = results2.outputs.out_odd || outputBuffer2;
+    log('STEP 13: Odd compute done: ' + Array.from(output2).join(', '));
+
+    const sentinels = Array.from(output2).filter(v => v === -999).length;
+    log('STEP 14: Sentinels remaining: ' + sentinels);
+    if (sentinels > 0) {
+      log('STEP 14-MISMATCH: CoreML used floor, buffer partially written');
+    }
+  } catch(e) {
+    log('STEP 9-14 FAIL: ' + e.message);
+  }
+
+  // maxPool2d test
+  try {
+    const builder3 = new MLGraphBuilder(context);
+    const input_max = builder3.input('max_in', { dataType: 'float32', shape: [1, 1, 5, 5] });
+    log('STEP 15: maxPool2d input created');
+
+    const pool_max = builder3.maxPool2d(input_max, {
+      windowDimensions: [2, 2],
+      strides: [2, 2],
+      padding: [0, 0, 0, 0],
+      roundingType: 'ceil',
+      layout: 'nchw'
+    });
+    log('STEP 16: maxPool2d op created');
+
+    const graph_max = await builder3.build({ 'out_max': pool_max });
+    log('STEP 17: maxPool2d graph built');
+
+    const inputData3 = new Float32Array(25);
+    for (let i = 0; i < 25; i++) inputData3[i] = i + 1;
+    const outputBuffer3 = new Float32Array(9);
+    outputBuffer3.fill(-999);
+
+    log('STEP 18: About to compute maxPool2d...');
+    const results3 = await context.compute(graph_max, { 'max_in': inputData3 }, { 'out_max': outputBuffer3 });
+    const output3 = results3.outputs.out_max || outputBuffer3;
+    log('STEP 19: maxPool2d done: ' + Array.from(output3).join(', '));
+  } catch(e) {
+    log('STEP 15-19 FAIL: ' + e.message);
+  }
+
+  log('STEP 20: ALL TESTS COMPLETE');
+}
+
+pinpoint();
+</script>
+</body>
+</html>

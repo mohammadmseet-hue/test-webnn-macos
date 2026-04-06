@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head><title>Control Test - Simple WebNN (no pool2d)</title></head>
+<body>
+<pre id="output"></pre>
+<script>
+const log = (msg) => {
+  console.log(msg);
+  document.getElementById('output').textContent += msg + '\n';
+};
+
+async function simpleWebNN() {
+  log('Control: Simple WebNN test (add operation, no pool2d)');
+
+  if (!navigator.ml) {
+    log('WebNN not available');
+    return;
+  }
+
+  try {
+    const context = await navigator.ml.createContext({ deviceType: 'gpu' });
+    const builder = new MLGraphBuilder(context);
+    log('Context and builder created');
+
+    const a = builder.input('a', { dataType: 'float32', shape: [2, 2] });
+    const b = builder.input('b', { dataType: 'float32', shape: [2, 2] });
+    const c = builder.add(a, b);
+
+    const graph = await builder.build({ 'c': c });
+    log('Graph built');
+
+    const aData = new Float32Array([1, 2, 3, 4]);
+    const bData = new Float32Array([5, 6, 7, 8]);
+    const cBuffer = new Float32Array(4);
+
+    const results = await context.compute(graph, { 'a': aData, 'b': bData }, { 'c': cBuffer });
+    const output = results.outputs.c || cBuffer;
+    log('Result: ' + Array.from(output).join(', '));
+    log('Expected: 6, 8, 10, 12');
+    log('Match: ' + (output[0] === 6 && output[1] === 8 && output[2] === 10 && output[3] === 12));
+  } catch(e) {
+    log('Error: ' + e.message);
+  }
+
+  log('Control test complete');
+}
+
+simpleWebNN();
+</script>
+</body>
+</html>

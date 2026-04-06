@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html>
+<head><title>PoC2: Compressed Texture Edge Cases - ANGLE Metal</title></head>
+<body>
+<canvas id="c" width="1" height="1"></canvas>
+<pre id="log"></pre>
+<script>
+function log(msg) {
+  document.getElementById('log').textContent += msg + '\n';
+  console.log('[POC2] ' + msg);
+}
+
+function getError(gl) {
+  const errs = [];
+  let e;
+  while ((e = gl.getError()) !== gl.NO_ERROR) errs.push('0x' + e.toString(16));
+  return errs.length ? errs.join(',') : 'none';
+}
+
+async function run() {
+  const canvas = document.getElementById('c');
+  const gl = canvas.getContext('webgl2');
+  if (!gl) { log('FAIL: No WebGL2'); return; }
+
+  log('Renderer: ' + gl.getParameter(gl.RENDERER));
+
+  // Try to get compressed texture extensions
+  const astc = gl.getExtension('WEBGL_compressed_texture_astc');
+  const s3tc = gl.getExtension('WEBGL_compressed_texture_s3tc');
+  const etc = gl.getExtension('WEBGL_compressed_texture_etc');
+  const bptc = gl.getExtension('EXT_texture_compression_bptc');
+  const rgtc = gl.getExtension('EXT_texture_compression_rgtc');
+
+  log('ASTC: ' + !!astc);
+  log('S3TC: ' + !!s3tc);
+  log('ETC: ' + !!etc);
+  log('BPTC: ' + !!bptc);
+  log('RGTC: ' + !!rgtc);
+
+  // Test compressed texture with edge-case sizes
+  // ASTC has block sizes: 4x4, 5x4, 5x5, 6x5, 6x6, 8x5, 8x6, 8x8, 10x5, 10x6, 10x8, 10x10, 12x10, 12x12
+  // Size calculation: ceil(width/blockW) * ceil(height/blockH) * bytesPerBlock
+
+  if (astc) {
+    log('\n--- ASTC Compressed Texture Tests ---');
+    const profiles = astc.getSupportedProfiles();
+    log('ASTC profiles: ' + JSON.stringify(profiles));
+
+    const astcFormats = [
+      [astc.COMPRESSED_RGBA_ASTC_4x4_KHR, 4, 4, 'ASTC 4x4'],
+      [astc.COMPRESSED_RGBA_ASTC_5x4_KHR, 5, 4, 'ASTC 5x4'],
+      [astc.COMPRESSED_RGBA_ASTC_5x5_KHR, 5, 5, 'ASTC 5x5'],
+      [astc.COMPRESSED_RGBA_ASTC_6x5_KHR, 6, 5, 'ASTC 6x5'],
+      [astc.COMPRESSED_RGBA_ASTC_8x8_KHR, 8, 8, 'ASTC 8x8'],
+      [astc.COMPRESSED_RGBA_ASTC_10x10_KHR, 10, 10, 'ASTC 10x10'],
+      [astc.COMPRESSED_RGBA_ASTC_12x12_KHR, 12, 12, 'ASTC 12x12'],
+    ];
+
+    const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+
+    for (const [fmt, bw, bh, desc] of astcFormats) {
+      // Test 1: Non-block-aligned dimensions (edge case in size calc)
+      const edgeSizes = [
+        [bw - 1, bh - 1],        // Just under one block
+        [bw + 1, bh + 1],        // Just over one block
+        [maxTex - 1, maxTex - 1], // Max minus 1
+        [maxTex, maxTex],         // Exact max
+        [1, 1],                   // Minimum
+        [bw * 1000 + 1, bh * 1000 + 1], // Non-aligned large
+      ];
+
+      for (const [w, h] of edgeSizes) {
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        
+        // Calculate expected compressed size
+        const blocksW = Math.ceil(w / bw);
+        const blocksH = Math.ceil(h / bh);
+        const dataSize = blocksW * blocksH * 16; // ASTC always 16 bytes per block
+        
+        // Create data buffer with calculated size
+        const data = new Uint8Array(dataSize);
+        
+        try {
+          gl.compressedTexImage2D(gl.TEXTURE_2D, 0, fmt, w, h, 0, data);
+          const err = getError(gl);
+          if (err !== 'none' && err !== '0x501') { // Ignore OUT_OF_MEMORY
+            log(desc + ' ' + w + 'x' + h + ': error=' + err);
+          }
+        } catch(e) {
+          log(desc + ' ' + w + 'x' + h + ': EXCEPTION: ' + e.message);
+        }
+        gl.deleteTexture(tex);
+      }
+
+      // Test 2: Mismatched data size (too small for dimensions)
+      const tex2 = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex2);
+      const tooSmall = new Uint8Array(16); // Only 1 block worth
+      try {
+        gl.compressedTexImage2D(gl.TEXTURE_2D, 0, fmt, 1024, 1024, 0, tooSmall);
+        log(desc + ' mismatched size 1024x1024 with 16 bytes: error=' + getError(gl));
+      } catch(e) {
+        log(desc + ' mismatched: ' + e.message.substring(0, 80));
+      }
+      gl.deleteTexture(tex2);
+
+      // Test 3: Zero data but valid dimensions
+      const tex3 = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex3);
+      try {
+        gl.compressedTexImage2D(gl.TEXTURE_2D, 0, fmt, 256, 256, 0, new Uint8Array(0));
+        log(desc + ' zero-length data 256x256: error=' + getError(gl));
+      } catch(e) {
+        log(desc + ' zero-length: ' + e.message.substring(0, 80));
+      }
+      gl.deleteTexture(tex3);
+    }
+  }
+
+  // Test with compressedTexSubImage2D - offset + size overflow
+  if (astc) {
+    log('\n--- compressedTexSubImage2D offset overflow ---');
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    const fmt = astc.COMPRESSED_RGBA_ASTC_4x4_KHR;
+    const dim = 256;
+    const blocks = (dim / 4) * (dim / 4);
+    const data = new Uint8Array(blocks * 16);
+    
+    gl.compressedTexImage2D(gl.TEXTURE_2D, 0, fmt, dim, dim, 0, data);
+    log('Base texture: error=' + getError(gl));
+    
+    // Try sub-image at various offsets
+    const subData = new Uint8Array(16); // 1 block
+    const offsets = [
+      [0, 0, 4, 4],
+      [dim - 4, dim - 4, 4, 4],
+      [dim, 0, 4, 4],          // Out of bounds
+      [0, dim, 4, 4],          // Out of bounds
+      [dim - 2, dim - 2, 4, 4], // Partially out of bounds, non-aligned
+    ];
+    
+    for (const [x, y, w, h] of offsets) {
+      try {
+        gl.compressedTexSubImage2D(gl.TEXTURE_2D, 0, x, y, w, h, fmt, subData);
+        log('SubImage offset=' + x + ',' + y + ' size=' + w + 'x' + h + ': error=' + getError(gl));
+      } catch(e) {
+        log('SubImage offset=' + x + ',' + y + ': ' + e.message.substring(0, 60));
+      }
+    }
+    gl.deleteTexture(tex);
+  }
+
+  // ETC2 tests if available
+  if (etc) {
+    log('\n--- ETC2 Edge Cases ---');
+    const etcFormats = [
+      [etc.COMPRESSED_RGBA8_ETC2_EAC, 4, 4, 16, 'ETC2 RGBA8'],
+      [etc.COMPRESSED_RGB8_ETC2, 4, 4, 8, 'ETC2 RGB8'],
+      [etc.COMPRESSED_R11_EAC, 4, 4, 8, 'EAC R11'],
+    ];
+
+    for (const [fmt, bw, bh, bpp, desc] of etcFormats) {
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      const w = 16384, h = 16384;
+      const blocks = Math.ceil(w/bw) * Math.ceil(h/bh);
+      const data = new Uint8Array(blocks * bpp);
+      try {
+        gl.compressedTexImage2D(gl.TEXTURE_2D, 0, fmt, w, h, 0, data);
+        log(desc + ' ' + w + 'x' + h + ': error=' + getError(gl));
+      } catch(e) {
+        log(desc + ' ' + w + 'x' + h + ': ' + e.message.substring(0, 80));
+      }
+      gl.deleteTexture(tex);
+    }
+  }
+
+  log('\n=== PoC2 Complete ===');
+}
+
+run().catch(e => log('FATAL: ' + e.message + '\n' + e.stack));
+</script>
+</body>
+</html>
